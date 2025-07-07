@@ -1,49 +1,105 @@
-package service
+package repository
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+
 	"wallet-api/internal/domain"
-	"wallet-api/internal/repository"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v4/pgxpool"
 )
 
-type WalletService struct {
-	repo repository.WalletRepository
+var (
+	ErrWalletNotFound = errors.New("wallet not found")
+)
+
+type WalletRepository interface {
+	Create(ctx context.Context, wallet *domain.Wallet) error
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.Wallet, error)
+	UpdateBalance(ctx context.Context, walletID uuid.UUID, amount int64) error
 }
 
-func NewWalletService(repo repository.WalletRepository) *WalletService {
-	return &WalletService{repo: repo}
+type walletRepository struct {
+	db *pgxpool.Pool
 }
 
-func (s *WalletService) CreateWallet(ctx context.Context, wallet *domain.Wallet) error {
-	return s.repo.Create(ctx, wallet)
+func NewWalletRepository(db *pgxpool.Pool) WalletRepository {
+	return &walletRepository{db: db}
 }
 
-func (s *WalletService) GetWalletByID(ctx context.Context, id uuid.UUID) (*domain.Wallet, error) {
-	return s.repo.GetByID(ctx, id)
-}
+// Create создаёт новый кошелёк в БД
+func (r *walletRepository) Create(ctx context.Context, wallet *domain.Wallet) error {
+	query := `
+        INSERT INTO wallets (id, balance)
+        VALUES ($1, $2)
+        ON CONFLICT (id) DO NOTHING`
 
-func (s *WalletService) ProcessOperation(ctx context.Context, req *domain.OperationRequest) error {
-	if req.WalletID == uuid.Nil {
-		return errors.New("invalid wallet ID")
-	}
-
-	wallet, err := s.repo.GetByID(ctx, req.WalletID)
+	_, err := r.db.Exec(ctx, query, wallet.ID, wallet.Balance)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create wallet: %w", err)
 	}
 
-	switch req.OperationType {
-	case domain.Deposit:
-		return s.repo.UpdateBalance(ctx, wallet.ID, req.Amount)
-	case domain.Withdraw:
-		if wallet.Balance < req.Amount {
-			return errors.New("not enough balance")
+	return nil
+}
+
+// GetByID возвращает кошелёк по ID
+func (r *walletRepository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Wallet, error) {
+	row := r.db.QueryRow(ctx, "SELECT id, balance FROM wallets WHERE id = $1", id)
+
+	var wallet domain.Wallet
+	err := row.Scan(&wallet.ID, &wallet.Balance)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrWalletNotFound
 		}
-		return s.repo.UpdateBalance(ctx, wallet.ID, -req.Amount)
-	default:
-		return errors.New("invalid operation type")
+		return nil, err
 	}
+
+	return &wallet, nil
+}
+
+// UpdateBalance изменяет баланс кошелька атомарно с блокировкой строки
+func (r *walletRepository) UpdateBalance(ctx context.Context, walletID uuid.UUID, amount int64) error {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			tx.Rollback(ctx)
+		}
+	}()
+
+	// Блокируем строку для последовательной обработки
+	var currentBalance sql.NullInt64
+	err = tx.QueryRow(ctx, "SELECT balance FROM wallets WHERE id = $1 FOR UPDATE", walletID).Scan(&currentBalance)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return ErrWalletNotFound
+		}
+		return fmt.Errorf("failed to lock wallet row: %w", err)
+	}
+
+	if !currentBalance.Valid {
+		return fmt.Errorf("balance is NULL for wallet ID: %s", walletID)
+	}
+
+	// Обновляем баланс
+	_, err = tx.Exec(ctx, "UPDATE wallets SET balance = balance + $1 WHERE id = $2", amount, walletID)
+	if err != nil {
+		return fmt.Errorf("failed to update balance: %w", err)
+	}
+
+	// Коммитим транзакцию
+	err = tx.Commit(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
 }
